@@ -6,9 +6,39 @@
 значениям mu выполняются одновременно как операции над массивами.
 """
 
+import csv
 import numpy as np
 
+# ======================================================================
+#  Именованные константы (все «магические числа» собраны здесь)
+# ======================================================================
+
+# Порог расхождения: итерация считается убежавшей, если |x| > OVERFLOW
 OVERFLOW = 1e10
+
+# Начальное условие для всех итерационных процедур
+X0 = 0.1
+
+# --- Бифуркационная диаграмма ---
+N_MU = 1200          # Число точек по оси μ (разрешение диаграммы)
+N_SKIP = 400         # Итераций на «прогрев» — отбрасываем переходный процесс
+N_PLOT = 200         # Итераций для записи — столько точек рисуется на каждом μ
+
+# --- Показатель Ляпунова ---
+N_ITER_LYAPUNOV = 1000   # Итераций для усреднения ln|f'(x)|
+N_SKIP_LYAPUNOV = 300    # Прогрев перед вычислением показателя
+
+# --- Определение периода ---
+N_SKIP_PERIOD = 5000     # Прогрев перед анализом периода (больше — надёжнее)
+N_CHECK_PERIOD = 4096    # Длина орбиты для проверки периодичности
+TOL_PERIOD = 1e-6        # Допуск: |x_{n} - x_{n+T}| < TOL => период T
+
+# --- Бисекция точки бифуркации ---
+BISECT_STEPS = 60        # Число шагов бисекции (даёт точность ~2^{-60} ≈ 1e-18)
+BISECT_TOL = 1e-14       # Остановка бисекции по ширине интервала
+
+# --- Грубый скан для поиска бифуркаций ---
+N_SCAN = 2000            # Число точек μ в первичном скане
 
 
 def generalized_map(x, mu, z):
@@ -16,23 +46,18 @@ def generalized_map(x, mu, z):
     return 1.0 - mu * np.abs(x) ** z
 
 
-def generalized_map_derivative(x, mu, z):
-    """Производная отображения по x."""
-    return -mu * z * np.abs(x) ** (z - 1) * np.sign(x)
-
-
 # ======================================================================
 #  Бифуркационная диаграмма (векторизована)
 # ======================================================================
 
-def bifurcation_data(z, mu_min=0.0, mu_max=2.0, n_mu=1200,
-                     n_skip=400, n_plot=200):
+def bifurcation_data(z, mu_min=0.0, mu_max=2.0, n_mu=N_MU,
+                     n_skip=N_SKIP, n_plot=N_PLOT):
     """
     Возвращает (mu_values, x_values) для scatter-plot.
     Все n_mu значений mu итерируются одновременно.
     """
     mu_arr = np.linspace(mu_min, mu_max, n_mu)
-    x = np.full(n_mu, 0.1)
+    x = np.full(n_mu, X0)
 
     for _ in range(n_skip):
         x = 1.0 - mu_arr * np.abs(x) ** z
@@ -54,16 +79,17 @@ def bifurcation_data(z, mu_min=0.0, mu_max=2.0, n_mu=1200,
 #  Показатель Ляпунова (векторизован)
 # ======================================================================
 
-def lyapunov_exponent(mu_arr, z, n_iter=1000, n_skip=300):
+def lyapunov_exponent(mu_arr, z, n_iter=N_ITER_LYAPUNOV, n_skip=N_SKIP_LYAPUNOV):
     """
     lambda(mu) = (1/N) * sum ln|f'(x_n)|  для каждого mu.
     """
     mu_arr = np.atleast_1d(mu_arr).astype(float)
     n = len(mu_arr)
-    x = np.full(n, 0.1)
+    x = np.full(n, X0)
 
     for _ in range(n_skip):
         x = 1.0 - mu_arr * np.abs(x) ** z
+        x = np.clip(x, -OVERFLOW, OVERFLOW)
 
     lyap_sum = np.zeros(n)
     for _ in range(n_iter):
@@ -82,7 +108,7 @@ def lyapunov_exponent(mu_arr, z, n_iter=1000, n_skip=300):
 #  Паутинная диаграмма (скалярная — быстрая сама по себе)
 # ======================================================================
 
-def cobweb_data(mu, z, x0=0.1, n_iter=80):
+def cobweb_data(mu, z, x0=X0, n_iter=80):
     """Возвращает (cobweb_x, cobweb_y) — ломаную для отрисовки."""
     cx = [x0, x0]
     cy = [0.0, 1.0 - mu * abs(x0) ** z]
@@ -101,7 +127,8 @@ def cobweb_data(mu, z, x0=0.1, n_iter=80):
 #  Определение периода — пакетная версия (векторизована)
 # ======================================================================
 
-def _detect_periods_batch(mu_arr, z, n_skip=2000, n_check=512, tol=1e-6):
+def _detect_periods_batch(mu_arr, z, n_skip=N_SKIP_PERIOD, n_check=N_CHECK_PERIOD,
+                          tol=TOL_PERIOD):
     """
     Определяет устойчивый период для каждого mu из массива.
     Все mu итерируются одновременно. Возвращает int-массив периодов
@@ -109,7 +136,7 @@ def _detect_periods_batch(mu_arr, z, n_skip=2000, n_check=512, tol=1e-6):
     """
     mu_arr = np.asarray(mu_arr, dtype=float)
     n = len(mu_arr)
-    x = np.full(n, 0.1)
+    x = np.full(n, X0)
 
     for _ in range(n_skip):
         x = 1.0 - mu_arr * np.abs(x) ** z
@@ -122,7 +149,7 @@ def _detect_periods_batch(mu_arr, z, n_skip=2000, n_check=512, tol=1e-6):
     ref = orbit[-1]
     periods = np.zeros(n, dtype=int)
 
-    for period in [1, 2, 4, 8, 16, 32, 64, 128, 256]:
+    for period in [1, 2, 4, 8, 16, 32, 64, 128, 256, 512]:
         if period * 8 > n_check:
             break
 
@@ -150,7 +177,8 @@ def _detect_periods_batch(mu_arr, z, n_skip=2000, n_check=512, tol=1e-6):
     return periods
 
 
-def _detect_period(mu, z, n_skip=2000, n_check=512, tol=1e-6):
+def _detect_period(mu, z, n_skip=N_SKIP_PERIOD, n_check=N_CHECK_PERIOD,
+                   tol=TOL_PERIOD):
     """Скалярная обёртка для совместимости (используется в бисекции)."""
     return int(_detect_periods_batch(np.array([mu]), z, n_skip, n_check, tol)[0])
 
@@ -159,17 +187,81 @@ def _detect_period(mu, z, n_skip=2000, n_check=512, tol=1e-6):
 #  Поиск точек бифуркаций
 # ======================================================================
 
-def _bisect_bifurcation(z, p_before, mu_lo, mu_hi):
-    """Уточняет точку бифуркации бисекцией между mu_lo и mu_hi."""
-    lo, hi = mu_lo, mu_hi
-    for _ in range(60):
-        mid = (lo + hi) / 2.0
-        per = _detect_period(mid, z)
-        if per == p_before:
-            lo = mid
+def _iterate_fp(mu, z, period, x_start):
+    """
+    Вычисляет f^period(x_start) и мультипликатор (произведение производных).
+    Возвращает (f^p(x), multiplier).  При расхождении возвращает (nan, nan).
+    """
+    y = x_start
+    mult = 1.0
+    for _ in range(period):
+        if abs(y) > OVERFLOW:
+            return np.nan, np.nan
+        if abs(y) > 1e-30:
+            mult *= -mu * z * abs(y) ** (z - 1) * np.sign(y)
         else:
-            hi = mid
-        if hi - lo < 1e-14:
+            mult = 0.0
+        y = 1.0 - mu * abs(y) ** z
+        if not np.isfinite(y):
+            return np.nan, np.nan
+    return y, mult
+
+
+def _newton_find_cycle(mu, z, period, x_start, max_iter=40):
+    """
+    Методом Ньютона находит неподвижную точку f^period (точку p-цикла).
+    Возвращает (x_fixed, multiplier).
+    """
+    x = x_start
+    for _ in range(max_iter):
+        y, mult = _iterate_fp(mu, z, period, x)
+        if not np.isfinite(y) or not np.isfinite(mult):
+            break
+        g = y - x
+        denom = mult - 1.0
+        if abs(denom) < 1e-30:
+            break
+        x -= g / denom
+        if abs(g) < 1e-15:
+            break
+    # Финальное вычисление мультипликатора в уточнённой точке
+    _, mult = _iterate_fp(mu, z, period, x)
+    return x, mult
+
+
+def _bisect_bifurcation(z, p_before, mu_lo, mu_hi):
+    """
+    Уточняет точку бифуркации бисекцией по устойчивости p-цикла.
+    Использует метод Ньютона для нахождения точной точки p-цикла
+    и проверяет знак |мультипликатор| − 1.
+    """
+    # Находим p-цикл при mu_lo (он здесь заведомо устойчив)
+    n_warmup = max(N_SKIP_PERIOD, p_before * 50)
+    x = X0
+    for _ in range(n_warmup):
+        x = 1.0 - mu_lo * abs(x) ** z
+    x_fp, _ = _newton_find_cycle(mu_lo, z, p_before, x)
+
+    # Верификация: расширяем скобку, пока mu_hi действительно
+    # не окажется по ту сторону бифуркации (|mult| >= 1)
+    x_track = x_fp
+    step = mu_hi - mu_lo
+    x_fp_hi, mult_hi = _newton_find_cycle(mu_hi, z, p_before, x_track)
+    while abs(mult_hi) < 1.0 and mu_hi < 2.0:
+        x_track = x_fp_hi
+        mu_hi = min(2.0, mu_hi + step)
+        x_fp_hi, mult_hi = _newton_find_cycle(mu_hi, z, p_before, x_track)
+
+    lo, hi = mu_lo, mu_hi
+    for _ in range(BISECT_STEPS):
+        mid = (lo + hi) / 2.0
+        x_fp_mid, mult = _newton_find_cycle(mid, z, p_before, x_fp)
+        if np.isfinite(mult) and abs(mult) < 1.0:
+            lo = mid
+            x_fp = x_fp_mid   # Отслеживаем p-цикл вдоль устойчивой ветви
+        else:
+            hi = mid           # Расходимость или |mult|>=1 → за бифуркацией
+        if hi - lo < BISECT_TOL:
             break
     return (lo + hi) / 2.0
 
@@ -179,7 +271,7 @@ def find_bifurcation_points(z, n_bifurcations=8):
     Находит точки бифуркаций удвоения периода.
     Грубый скан (векторизованный) + предсказание + бисекция.
     """
-    n_scan = 800
+    n_scan = N_SCAN
     scan_mus = np.linspace(0.001, 2.0, n_scan)
     periods = _detect_periods_batch(scan_mus, z)
 
@@ -187,12 +279,15 @@ def find_bifurcation_points(z, n_bifurcations=8):
     run_start = 0
     for i in range(1, n_scan):
         if periods[i] != periods[run_start] or i == n_scan - 1:
-            length = i - run_start
+            # Если это последний элемент и он принадлежит текущей серии,
+            # включаем его в длину
+            end = i if periods[i] != periods[run_start] else i + 1
+            length = end - run_start
             if length >= 3 and periods[run_start] > 0:
                 stable_zones.append((
                     int(periods[run_start]),
                     scan_mus[run_start],
-                    scan_mus[min(i - 1, n_scan - 1)],
+                    scan_mus[min(end - 1, n_scan - 1)],
                 ))
             run_start = i
 
@@ -204,7 +299,7 @@ def find_bifurcation_points(z, n_bifurcations=8):
             bif_mu = _bisect_bifurcation(z, p1, mu1_end, mu2_start)
             bif_points.append(bif_mu)
 
-    while len(bif_points) >= 2 and len(bif_points) < n_bifurcations - 1:
+    while len(bif_points) >= 2 and len(bif_points) < n_bifurcations:
         n = len(bif_points)
         d_last = bif_points[-1] - bif_points[-2]
         ds = feigenbaum_deltas(np.array(bif_points))
@@ -216,31 +311,19 @@ def find_bifurcation_points(z, n_bifurcations=8):
         if predicted > 2.0 or predicted < bif_points[-1]:
             break
 
-        lo_s = bif_points[-1] + d_next * 0.1
-        hi_s = min(2.0, predicted + d_next * 2)
-
+        # Используем Ньютон-трекинг вместо определения периода:
+        # p_before — текущий период, его цикл рождается при bif_points[-1]
+        # и теряет устойчивость при следующей бифуркации.
+        # mu_lo берём в середине предсказанного окна (цикл хорошо устойчив),
+        # mu_hi — с запасом за предсказание.
         p_before = 1 << n
-        n_fine = 300
-        fine_mus = np.linspace(lo_s, hi_s, n_fine)
-        fine_periods = _detect_periods_batch(fine_mus, z)
+        mu_lo = bif_points[-1] + d_next * 0.4
+        mu_hi = min(2.0, predicted + d_next * 3)
 
-        start_idx = -1
-        for i in range(n_fine):
-            if fine_periods[i] == p_before:
-                start_idx = i
-                break
-
-        found = False
-        if start_idx >= 0:
-            for i in range(start_idx + 1, n_fine):
-                if fine_periods[i - 1] == p_before and fine_periods[i] != p_before:
-                    bif_mu = _bisect_bifurcation(z, p_before,
-                                                  fine_mus[i - 1], fine_mus[i])
-                    bif_points.append(bif_mu)
-                    found = True
-                    break
-
-        if not found:
+        bif_mu = _bisect_bifurcation(z, p_before, mu_lo, mu_hi)
+        if bif_mu > bif_points[-1] + 1e-15:
+            bif_points.append(bif_mu)
+        else:
             break
 
     return np.array(bif_points)
@@ -344,3 +427,29 @@ def scaling_zoom_regions(z, n_zooms=3):
         regions.append((mu_lo, mu_hi, x_lo, x_hi))
 
     return regions
+
+
+# ======================================================================
+#  Экспорт таблицы Фейгенбаума в CSV
+# ======================================================================
+
+def export_feigenbaum_table(z, filename, n_bifurcations=8):
+    """
+    Сохраняет CSV-таблицу с колонками: n, mu_n, delta_n, alpha_n.
+    Возвращает (bif_points, deltas, alphas) для дальнейшего использования.
+    """
+    bp = find_bifurcation_points(z, n_bifurcations)
+    ds = feigenbaum_deltas(bp)
+    als = feigenbaum_alphas(z, bp)
+
+    with open(filename, "w", newline="", encoding="utf-8") as f:
+        writer = csv.writer(f)
+        writer.writerow(["n", "mu_n", "delta_n", "alpha_n"])
+        for i in range(len(bp)):
+            d = ds[i - 1] if 0 <= i - 1 < len(ds) else ""
+            a = als[i - 1] if 0 <= i - 1 < len(als) else ""
+            writer.writerow([i + 1, f"{bp[i]:.12f}",
+                             f"{d:.8f}" if d != "" else "",
+                             f"{a:.8f}" if a != "" else ""])
+
+    return bp, ds, als
