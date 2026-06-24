@@ -13,16 +13,38 @@
 
 import numpy as np
 import matplotlib
-try:
-    matplotlib.use("TkAgg")
-except ImportError:
-    pass
+
+_BACKENDS = ["TkAgg", "Qt5Agg", "GTK3Agg", "macosx", "WebAgg"]
+_backend_ok = False
+for _be in _BACKENDS:
+    try:
+        matplotlib.use(_be)
+        __import__(f"matplotlib.backends.backend_{_be.lower()}")
+        _backend_ok = True
+        break
+    except (ImportError, ModuleNotFoundError):
+        continue
+if not _backend_ok:
+    raise RuntimeError(
+        "Не найден интерактивный бэкенд matplotlib.\n"
+        "Установите один из: python3-tk (sudo apt install python3-tk), PyQt5, GTK3."
+    )
 import matplotlib.pyplot as plt
 from matplotlib.widgets import Slider, Button
 from matplotlib.gridspec import GridSpec
 from matplotlib.patches import Rectangle
 
+import os
 import core
+
+_CACHE_MAX = 20
+
+
+def _cache_put(cache, key, value):
+    if len(cache) >= _CACHE_MAX:
+        oldest = next(iter(cache))
+        del cache[oldest]
+    cache[key] = value
 
 
 COLORS = {
@@ -58,6 +80,11 @@ TAB_NAMES = [
 
 DYN_TAB = 5
 
+SLIDER_LEFT_TOP = [0.15, 0.05, 0.30, 0.025]     # z
+SLIDER_LEFT_BOTTOM = [0.15, 0.02, 0.30, 0.025]   # μ
+SLIDER_RIGHT_TOP = [0.60, 0.05, 0.30, 0.025]
+CSV_BTN_POS = [0.30, 0.02, 0.12, 0.025]
+
 
 class ChaosApp:
     def __init__(self):
@@ -91,13 +118,22 @@ class ChaosApp:
         self.gs = GridSpec(
             12, 12,
             figure=self.fig,
-            left=0.07, right=0.97, top=0.92, bottom=0.13,
+            left=0.07, right=0.97, top=0.85, bottom=0.13,
             hspace=0.4, wspace=0.35,
         )
 
         self._create_tab_buttons()
         self._create_sliders()
         self._create_axes()
+
+        
+        self._bif_xlim_default = (0, 2)
+        self._bif_ylim_default = (-1.5, 1.5)
+        self._drag_start = None
+        self.fig.canvas.mpl_connect("scroll_event", self._on_scroll)
+        self.fig.canvas.mpl_connect("button_press_event", self._on_press)
+        self.fig.canvas.mpl_connect("button_release_event", self._on_release)
+        self.fig.canvas.mpl_connect("motion_notify_event", self._on_motion)
 
         self._show_tab(0)
 
@@ -143,7 +179,7 @@ class ChaosApp:
 
     def _create_sliders(self):
         ax_z = self.fig.add_axes(
-            [0.15, 0.05, 0.30, 0.025], facecolor=COLORS["panel"]
+            SLIDER_LEFT_TOP, facecolor=COLORS["panel"]
         )
         self.slider_z = Slider(
             ax_z, "z", 1.5, 6.0, valinit=self.z_val,
@@ -154,7 +190,7 @@ class ChaosApp:
         self.slider_z.on_changed(self._on_z_changed)
 
         ax_mu = self.fig.add_axes(
-            [0.15, 0.02, 0.30, 0.025], facecolor=COLORS["panel"]
+            SLIDER_LEFT_BOTTOM, facecolor=COLORS["panel"]
         )
         self.slider_mu = Slider(
             ax_mu, "μ", 0.01, 2.0, valinit=self.mu_val,
@@ -165,7 +201,7 @@ class ChaosApp:
         self.slider_mu.on_changed(self._on_mu_changed)
 
         ax_n = self.fig.add_axes(
-            [0.60, 0.05, 0.30, 0.025], facecolor=COLORS["panel"]
+            SLIDER_RIGHT_TOP, facecolor=COLORS["panel"]
         )
         self.slider_n = Slider(
             ax_n, "Итераций", 10, 200, valinit=self.n_iter_cobweb,
@@ -176,7 +212,7 @@ class ChaosApp:
         self.slider_n.on_changed(self._on_n_changed)
 
         ax_speed = self.fig.add_axes(
-            [0.60, 0.05, 0.30, 0.025], facecolor=COLORS["panel"]
+            SLIDER_RIGHT_TOP, facecolor=COLORS["panel"]
         )
         self.slider_speed = Slider(
             ax_speed, "Скорость", 1, 50, valinit=self.speed_val,
@@ -255,9 +291,23 @@ class ChaosApp:
         ax.grid(True, color=COLORS["grid"], alpha=0.3, linewidth=0.5)
 
     def _hide_all_axes(self):
-        for ax in ([self.ax_main, self.ax_left, self.ax_right,
-                     self.ax_dyn_left, self.ax_dyn_right] + self.ax_panels):
+        """Скрывает все оси и полностью отключает их от обработки событий."""
+        all_plot_axes = ([self.ax_main, self.ax_left, self.ax_right,
+                          self.ax_dyn_left, self.ax_dyn_right] + self.ax_panels)
+        for ax in all_plot_axes:
             ax.set_visible(False)
+            ax.set_navigate(False)
+            ax.set_zorder(-10)
+
+        for ax in self.slider_axes.values():
+            ax.set_visible(False)
+            ax.set_navigate(False)
+            ax.set_zorder(-10)
+
+        for bax in self.dyn_btn_axes:
+            bax.set_visible(False)
+            bax.set_navigate(False)
+            bax.set_zorder(-10)
 
     # ----------------------------------------------------------- tab switching
     def _show_tab(self, idx):
@@ -282,29 +332,28 @@ class ChaosApp:
 
         is_dyn = idx == DYN_TAB
         slider_visibility = {
-            0: {"z": True,  "mu": False, "n": False, "speed": False},
-            1: {"z": True,  "mu": True,  "n": True,  "speed": False},
-            2: {"z": True,  "mu": False, "n": False, "speed": False},
-            3: {"z": True,  "mu": False, "n": False, "speed": False},
-            4: {"z": True,  "mu": False, "n": False, "speed": False},
-            5: {"z": True,  "mu": True,  "n": False, "speed": True},
+            0: {"z": True, "mu": False, "n": False, "speed": False},
+            1: {"z": True, "mu": True, "n": True, "speed": False},
+            2: {"z": True, "mu": False, "n": False, "speed": False},
+            3: {"z": True, "mu": False, "n": False, "speed": False},
+            4: {"z": True, "mu": False, "n": False, "speed": False},
+            5: {"z": True, "mu": True, "n": False, "speed": True},
         }
+
         for key, visible in slider_visibility[idx].items():
             ax = self.slider_axes[key]
             ax.set_visible(visible)
+            ax.set_navigate(visible)
             ax.set_zorder(10 if visible else -10)
 
         for bax in self.dyn_btn_axes:
             bax.set_visible(is_dyn)
+            bax.set_navigate(is_dyn)
             bax.set_zorder(10 if is_dyn else -10)
 
         draw_funcs = [
-            self._draw_bifurcation,
-            self._draw_cobweb,
-            self._draw_lyapunov,
-            self._draw_feigenbaum,
-            self._draw_scaling,
-            self._draw_dynamics,
+            self._draw_bifurcation, self._draw_cobweb, self._draw_lyapunov,
+            self._draw_feigenbaum, self._draw_scaling, self._draw_dynamics,
         ]
         draw_funcs[idx]()
         self.fig.canvas.draw_idle()
@@ -334,6 +383,45 @@ class ChaosApp:
         if self._timer is not None and self._anim_running:
             self._timer.interval = max(10, 1000 // self.speed_val)
 
+    # ------------------------------------------------- zoom & pan (бифуркация)
+    def _on_scroll(self, event):
+        if self.current_tab != 0 or event.inaxes != self.ax_main:
+            return
+        ax = self.ax_main
+        scale = 0.8 if event.button == "up" else 1.25
+        xdata, ydata = event.xdata, event.ydata
+        xl, xr = ax.get_xlim()
+        yb, yt = ax.get_ylim()
+        ax.set_xlim(xdata - (xdata - xl) * scale, xdata + (xr - xdata) * scale)
+        ax.set_ylim(ydata - (ydata - yb) * scale, ydata + (yt - ydata) * scale)
+        self.fig.canvas.draw_idle()
+
+    def _on_press(self, event):
+        if self.current_tab != 0 or event.inaxes != self.ax_main:
+            return
+        if event.button == 1:
+            self._drag_start = (event.xdata, event.ydata)
+        elif event.button == 3:
+            self.ax_main.set_xlim(*self._bif_xlim_default)
+            self.ax_main.set_ylim(*self._bif_ylim_default)
+            self.fig.canvas.draw_idle()
+
+    def _on_release(self, event):
+        self._drag_start = None
+
+    def _on_motion(self, event):
+        if (self._drag_start is None or self.current_tab != 0
+                or event.inaxes != self.ax_main or event.xdata is None):
+            return
+        dx = self._drag_start[0] - event.xdata
+        dy = self._drag_start[1] - event.ydata
+        ax = self.ax_main
+        xl, xr = ax.get_xlim()
+        yb, yt = ax.get_ylim()
+        ax.set_xlim(xl + dx, xr + dx)
+        ax.set_ylim(yb + dy, yt + dy)
+        self.fig.canvas.draw_idle()
+
     # ================================================= TAB 1: Bifurcation
     def _draw_bifurcation(self):
         ax = self.ax_main
@@ -344,9 +432,9 @@ class ChaosApp:
         z = self.z_val
         cache_key = round(z, 1)
         if cache_key not in self._bif_cache:
-            self._bif_cache[cache_key] = core.bifurcation_data(
-                z, mu_min=0.0, mu_max=2.0, n_mu=1200, n_skip=400, n_plot=200,
-            )
+            _cache_put(self._bif_cache, cache_key, core.bifurcation_data(
+                z, mu_min=0.0, mu_max=2.0,
+            ))
         mu_data, x_data = self._bif_cache[cache_key]
 
         ax.scatter(mu_data, x_data, s=0.02, c=COLORS["scatter"], alpha=0.5, linewidths=0)
@@ -400,8 +488,8 @@ class ChaosApp:
         cache_key = round(z, 1)
         if cache_key not in self._lyap_cache:
             mu_arr = np.linspace(0.01, 2.0, 1000)
-            lyap = core.lyapunov_exponent(mu_arr, z, n_iter=800, n_skip=300)
-            self._lyap_cache[cache_key] = (mu_arr, lyap)
+            lyap = core.lyapunov_exponent(mu_arr, z, n_iter=800)
+            _cache_put(self._lyap_cache, cache_key, (mu_arr, lyap))
         mu_arr, lyap = self._lyap_cache[cache_key]
 
         pos = lyap >= 0
@@ -437,7 +525,7 @@ class ChaosApp:
             bp = core.find_bifurcation_points(z, n_bifurcations=7)
             ds = core.feigenbaum_deltas(bp)
             als = core.feigenbaum_alphas(z, bp)
-            self._feig_cache[cache_key] = (bp, ds, als)
+            _cache_put(self._feig_cache, cache_key, (bp, ds, als))
         bp, ds, als = self._feig_cache[cache_key]
 
         ax = self.ax_left
@@ -458,46 +546,86 @@ class ChaosApp:
         ax.legend(loc="best", fontsize=9, facecolor=COLORS["panel"],
                   edgecolor=COLORS["grid"], labelcolor=COLORS["text"])
 
+        # Подробная таблица n | μ_n | δ_n | α_n для текущего z
         if len(bp) > 0:
-            txt_lines = ["Точки бифуркаций:"]
-            for i, m in enumerate(bp):
-                txt_lines.append(f"  μ_{i + 1} = {m:.8f}")
-            if len(ds) > 0:
-                txt_lines.append(f"\nδ → {ds[-1]:.4f}")
-            if len(als) > 0:
-                txt_lines.append(f"α → {als[-1]:.4f}")
-            ax.text(
-                0.98, 0.02, "\n".join(txt_lines),
-                transform=ax.transAxes, fontsize=8,
-                verticalalignment="bottom", horizontalalignment="right",
-                color=COLORS["text"], alpha=0.8,
-                bbox=dict(boxstyle="round,pad=0.4", facecolor=COLORS["bg"], alpha=0.7),
+            col_labels_left = ["n", "μ_n", "δ_n", "α_n"]
+            tbl_data = []
+            for i in range(len(bp)):
+                d_val = ds[i - 1] if 0 <= i - 1 < len(ds) else None
+                a_val = als[i - 1] if 0 <= i - 1 < len(als) else None
+                tbl_data.append([
+                    str(i + 1),
+                    f"{bp[i]:.8f}",
+                    f"{d_val:.4f}" if d_val is not None and not np.isnan(d_val) else "—",
+                    f"{a_val:.4f}" if a_val is not None and not np.isnan(a_val) else "—",
+                ])
+            tbl_left = ax.table(
+                cellText=tbl_data,
+                colLabels=col_labels_left,
+                cellLoc="center",
+                loc="lower right",
+                bbox=[0.38, 0.02, 0.60, min(0.08 * (len(bp) + 1), 0.75)],
             )
+            tbl_left.auto_set_font_size(False)
+            tbl_left.set_fontsize(8)
+            for (row, col), cell in tbl_left.get_celld().items():
+                cell.set_edgecolor(COLORS["grid"])
+                if row == 0:
+                    cell.set_facecolor(COLORS["grid"])
+                    cell.set_text_props(color=COLORS["text"], fontweight="bold")
+                else:
+                    cell.set_facecolor(COLORS["bg"])
+                    cell.set_text_props(color=COLORS["text"])
+                    cell.set_alpha(0.85)
 
         ax2 = self.ax_right
         if self._feig_vs_z_cache is None:
-            z_arr = np.array([2.0, 2.5, 3.0, 3.5, 4.0, 5.0, 6.0])
+            z_arr = np.array([2.0, 2.1, 2.2, 2.3, 2.5, 3.0, 4.0, 6.0])
             d_arr, a_arr = core.feigenbaum_constants_vs_z(z_arr, n_bif=6)
             self._feig_vs_z_cache = (z_arr, d_arr, a_arr)
         z_arr, d_arr, a_arr = self._feig_vs_z_cache
 
-        mask_d = ~np.isnan(d_arr)
-        mask_a = ~np.isnan(a_arr)
-        if np.any(mask_d):
-            ax2.plot(z_arr[mask_d], d_arr[mask_d], "o-", color=COLORS["accent1"],
-                     markersize=7, linewidth=2, label="δ(z)")
-        if np.any(mask_a):
-            ax2.plot(z_arr[mask_a], a_arr[mask_a], "s-", color=COLORS["accent2"],
-                     markersize=7, linewidth=2, label="α(z)")
+        ax2.set_axis_off()
+        ax2.set_title("Константы Фейгенбаума для разных z", fontsize=12, pad=8,
+                       color=COLORS["text"])
 
-        ax2.axhline(4.6692, color=COLORS["accent1"], linestyle="--", alpha=0.4, label="δ = 4.6692 (z=2)")
-        ax2.axhline(2.5029, color=COLORS["accent2"], linestyle="--", alpha=0.4, label="α = 2.5029 (z=2)")
+        col_labels = ["z", "δ (delta)", "α (alpha)"]
+        table_data = []
+        cell_colors = []
+        for i, z_v in enumerate(z_arr):
+            d_str = f"{d_arr[i]:.4f}" if not np.isnan(d_arr[i]) else "—"
+            a_str = f"{a_arr[i]:.4f}" if not np.isnan(a_arr[i]) else "—"
+            table_data.append([f"{z_v:.1f}", d_str, a_str])
+            is_current = abs(z_v - self.z_val) < 0.05
+            if is_current:
+                cell_colors.append([COLORS["btn_active"]] * 3)
+            else:
+                cell_colors.append([COLORS["panel"]] * 3)
 
-        ax2.set_xlabel("z (порядок экстремума)", fontsize=11)
-        ax2.set_ylabel("Значение константы", fontsize=11)
-        ax2.set_title("Зависимость констант Фейгенбаума от z", fontsize=12, pad=8)
-        ax2.legend(loc="best", fontsize=8, facecolor=COLORS["panel"],
-                   edgecolor=COLORS["grid"], labelcolor=COLORS["text"])
+        tbl = ax2.table(
+            cellText=table_data,
+            colLabels=col_labels,
+            cellColours=cell_colors,
+            colColours=[COLORS["grid"]] * 3,
+            cellLoc="center",
+            loc="center",
+        )
+        tbl.auto_set_font_size(False)
+        tbl.set_fontsize(10)
+        tbl.scale(1.0, 1.8)
+
+        for (row, col), cell in tbl.get_celld().items():
+            cell.set_edgecolor(COLORS["grid"])
+            if row == 0:
+                cell.set_text_props(color=COLORS["text"], fontweight="bold")
+                cell.set_facecolor(COLORS["grid"])
+            else:
+                is_current = abs(z_arr[row - 1] - self.z_val) < 0.05
+                if is_current:
+                    cell.set_text_props(color=COLORS["btn_active_text"],
+                                        fontweight="bold")
+                else:
+                    cell.set_text_props(color=COLORS["text"])
 
     # ================================================= TAB 5: Scaling
     def _draw_scaling(self):
@@ -522,7 +650,7 @@ class ChaosApp:
                     z, mu_min=mu_lo, mu_max=mu_hi, n_mu=n_mu, n_skip=500, n_plot=200,
                 )
                 panels_data.append((mu_data, x_data, mu_lo, mu_hi, x_lo, x_hi))
-            self._scaling_cache[cache_key] = panels_data
+            _cache_put(self._scaling_cache, cache_key, panels_data)
 
         panels_data = self._scaling_cache[cache_key]
         titles = ["Полный вид", "Зум ×1", "Зум ×2"]
@@ -616,6 +744,13 @@ class ChaosApp:
 
         if abs(y) > 1e6:
             self._stop_animation()
+            ax_r.text(
+                0.5, 0.5, "Орбита расходится — анимация остановлена",
+                transform=ax_r.transAxes, fontsize=12,
+                ha="center", va="center", color=COLORS["accent2"],
+                bbox=dict(boxstyle="round,pad=0.5", facecolor=COLORS["bg"], alpha=0.9),
+            )
+            self.fig.canvas.draw_idle()
             return
 
         n_lines = len(self._anim_cobweb_lines)
@@ -688,6 +823,29 @@ class ChaosApp:
             return
         self._anim_step(None)
         self.fig.canvas.draw_idle()
+
+    # -------------------------------------------------------- CSV export
+    def _on_export_csv(self, event):
+        z = self.z_val
+        filename = f"feigenbaum_z{z:.1f}.csv"
+        try:
+            core.export_feigenbaum_table(z, filename, n_bifurcations=8)
+            full_path = os.path.abspath(filename)
+            self.ax_left.text(
+                0.02, 0.96, f"Сохранено: {full_path}",
+                transform=self.ax_left.transAxes, fontsize=8,
+                verticalalignment="top", color=COLORS["accent3"],
+                bbox=dict(boxstyle="round,pad=0.3", facecolor=COLORS["bg"], alpha=0.85),
+            )
+            self.fig.canvas.draw_idle()
+        except Exception as e:
+            self.ax_left.text(
+                0.02, 0.96, f"Ошибка: {e}",
+                transform=self.ax_left.transAxes, fontsize=8,
+                verticalalignment="top", color=COLORS["accent2"],
+                bbox=dict(boxstyle="round,pad=0.3", facecolor=COLORS["bg"], alpha=0.85),
+            )
+            self.fig.canvas.draw_idle()
 
     # -------------------------------------------------------------------- run
     def run(self):
